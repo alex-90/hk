@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# hk — CLI for HOSTKEY built on Terraform data sources.
+set -euo pipefail
+
+PORTAL="${HK_PORTAL:-com}"   # com | ru
+LOC="${HK_LOCATION:-NL}"
+FMT="table"
+
+usage() {
+  cat <<USAGE
+usage: hk [-p com|ru] [-l LOC] [-j] <command> [args]
+
+  servers                   account servers
+  presets [prefix]          presets (hk presets vm.)
+  oses <preset_id> [name]   OS images for a preset
+  plans <preset_id>         traffic plans for a preset
+  software <preset_id>      marketplace software for a preset
+  ssh-keys                  account SSH keys
+  dns                       account DNS zones
+
+  -p   portal: com (default) or ru      env: HK_PORTAL
+  -l   location (default $LOC)          env: HK_LOCATION
+  -j   raw JSON instead of a table
+USAGE
+}
+
+while getopts "p:l:jh" o; do
+  case "$o" in
+    p) PORTAL="$OPTARG" ;;
+    l) LOC="$OPTARG" ;;
+    j) FMT="json" ;;
+    *) usage; exit 0 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+case "$PORTAL" in com|ru) ;; *) echo "hk: portal must be com or ru" >&2; exit 1 ;; esac
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DIR="${HK_TF_DIR:-$SELF_DIR/tf/$PORTAL}"
+ENV_FILE="${HK_ENV_FILE:-$HOME/.config/hostkey/$PORTAL.env}"
+
+if [ -z "${HOSTKEY_API_KEY:-}" ] && [ -f "$ENV_FILE" ]; then
+  set -a; . "$ENV_FILE"; set +a
+fi
+[ -n "${HOSTKEY_API_KEY:-}" ] || { echo "hk: no HOSTKEY_API_KEY, put it in $ENV_FILE" >&2; exit 1; }
+
+for bin in terraform jq column; do
+  command -v "$bin" >/dev/null || { echo "hk: $bin not found" >&2; exit 1; }
+done
+
+if [ ! -d "$DIR/.terraform" ] && ! grep -qs dev_overrides "${TF_CLI_CONFIG_FILE:-$HOME/.terraformrc}"; then
+  terraform -chdir="$DIR" init -input=false >/dev/null
+fi
+
+cmd="${1:-}"; shift || true
+
+fetch() {
+  local args=(-auto-approve -refresh-only -input=false -var "location=$LOC")
+  [ -n "${1:-}" ] && args+=(-var "preset_id=$1")
+  terraform -chdir="$DIR" apply "${args[@]}" >/dev/null
+}
+
+show() {   # show <output> <jq columns> [name prefix]
+  local json
+  json=$(terraform -chdir="$DIR" output -json "$1" 2>/dev/null) || {
+    echo "hk: output '$1' not found in $DIR" >&2; exit 1; }
+  if [ "$FMT" = "json" ]; then echo "$json" | jq .; return; fi
+  echo "$json" | jq -r --arg p "${3:-}" "
+      .[]?
+      | select((.name // .hostname // \"\") | startswith(\$p))
+      | [$2] | map(tostring) | @tsv" | column -t -s $'\t'
+}
+
+need_id() { [ -n "${1:-}" ] || { echo "hk: preset_id required, see: hk presets" >&2; exit 1; }; }
+
+case "$cmd" in
+  servers)
+    [ -f "$DIR/servers.tf" ] || {
+      echo "hk: servers needs hostkey_servers; enable $DIR/servers.tf (see README)" >&2; exit 1; }
+    fetch "";           show servers  '.id, .hostname, .main_ipv4, .location, .status' ;;
+  presets)  fetch "";           show presets  '.id, .name, .locations' "${1:-}" ;;
+  oses)     need_id "${1:-}"; fetch "$1"; show oses     '.id, .name, .active' "${2:-}" ;;
+  plans)    need_id "${1:-}"; fetch "$1"; show traffic_plans '.id, .name, .location, .active' ;;
+  software) need_id "${1:-}"; fetch "$1"; show software '.id, .name, .active' ;;
+  ssh-keys) fetch "";           show ssh_keys '.id, .name, .default' ;;
+  dns)      fetch "";           show dns_domains '.id, .name' ;;
+  ""|help|-h|--help) usage ;;
+  *) echo "hk: unknown command '$cmd'" >&2; usage; exit 1 ;;
+esac
